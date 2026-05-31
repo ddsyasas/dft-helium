@@ -96,3 +96,14 @@ def test_m4_scf_lda_exchange_total_energy(grid):
     """
     res = dft.scf_lda_x(Z=2.0, r=grid, verbose=False)
     assert abs(res["E"] - (-2.72)) < 1e-2
+
+
+# --- Milestone 5: full Hartree + Slater exchange + PZ correlation ------------
+def test_m5_scf_lda_xc_total_energy(grid):
+    """Full LDA (Hartree + Slater X + PZ correlation) must give E = -2.83 Ha.
+
+    Correlation is a small attractive correction that deepens the M4 -2.72 toward
+    the exact -2.90; the LDA lands at about -2.83.
+    """
+    res = dft.scf_lda_xc(Z=2.0, r=grid, verbose=False)
+    assert abs(res["E"] - (-2.83)) < 1e-2

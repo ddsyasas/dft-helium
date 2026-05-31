@@ -146,7 +146,8 @@ def _u0(E, V, r, h):
     return 2.0 * u[0] - u[1], u
 
 
-def eigenstate(V, r, h=H_STEP, e_lo=-3.0, e_hi=-0.01, n_scan=200, tol=1e-10):
+def eigenstate(V, r, h=H_STEP, e_lo=-3.0, e_hi=-0.01, n_scan=200, tol=1e-10,
+               e_guess=None):
     """Find the GROUND-STATE energy E and normalised u(r) for ANY potential V(r).
 
     This is the generalised version of the M1 solver: M1 used the fixed bare
@@ -154,25 +155,50 @@ def eigenstate(V, r, h=H_STEP, e_lo=-3.0, e_hi=-0.01, n_scan=200, tol=1e-10):
     V(r) = -Z/r + V_H(r) + ... , so the potential is passed in as an array.
 
     Two stages (identical algorithm to M1):
-      1. Coarse scan of E over [e_lo, e_hi] for the lowest (most negative) sign
-         change of the extrapolated u(0). The lowest crossing is the nodeless
-         ground state; higher crossings are excited s-states (2s, ...).
+      1. Bracket the ground state. By default we coarse-scan E over [e_lo, e_hi]
+         for the lowest (most negative) sign change of the extrapolated u(0); the
+         lowest crossing is the nodeless ground state (higher crossings are 2s,
+         ...). If `e_guess` is given (an SCF warm start), we instead bracket
+         LOCALLY by expanding a small window around the guess until the sign
+         changes -- far cheaper than a full rescan when we already know roughly
+         where the eigenvalue sits. Either way stage 2 bisects the SAME isolated
+         root to the SAME tolerance, so the answer is identical; the guess only
+         changes how we find the bracket, not the bracketed root.
       2. Bisection inside that bracket until the energy is pinned to 'tol'.
     """
-    # Stage 1: scan for the first sign change as E increases from e_lo.
-    energies = np.linspace(e_lo, e_hi, n_scan)
-    e_prev = energies[0]
-    prev_val, _ = _u0(e_prev, V, r, h)
     bracket = None
-    for E in energies[1:]:
-        val, _ = _u0(E, V, r, h)
-        if np.sign(val) != np.sign(prev_val):
-            bracket = (e_prev, E)
-            break
-        e_prev, prev_val = E, val
+    if e_guess is not None:
+        # Local bracketing around the warm start. Expand a symmetric window
+        # (clamped to [e_lo, e_hi]) until u(0) changes sign across it. Starting
+        # near the true root, this brackets it long before reaching a neighbour.
+        lo, hi = e_guess - 0.02, e_guess + 0.02
+        f_lo, _ = _u0(max(lo, e_lo), V, r, h)
+        f_hi, _ = _u0(min(hi, e_hi), V, r, h)
+        for _ in range(60):
+            if np.sign(f_lo) != np.sign(f_hi):
+                bracket = (max(lo, e_lo), min(hi, e_hi))
+                break
+            lo, hi = lo - 0.05, hi + 0.05
+            if lo <= e_lo or hi >= e_hi:   # fell off the window: scan instead
+                break
+            f_lo, _ = _u0(lo, V, r, h)
+            f_hi, _ = _u0(hi, V, r, h)
+        # If the local search failed, fall through to the robust full scan.
+
     if bracket is None:
-        raise RuntimeError("No bound state found in the scan window; "
-                           "widen [e_lo, e_hi].")
+        # Stage 1 (default): scan for the first sign change as E rises from e_lo.
+        energies = np.linspace(e_lo, e_hi, n_scan)
+        e_prev = energies[0]
+        prev_val, _ = _u0(e_prev, V, r, h)
+        for E in energies[1:]:
+            val, _ = _u0(E, V, r, h)
+            if np.sign(val) != np.sign(prev_val):
+                bracket = (e_prev, E)
+                break
+            e_prev, prev_val = E, val
+        if bracket is None:
+            raise RuntimeError("No bound state found in the scan window; "
+                               "widen [e_lo, e_hi].")
 
     # Stage 2: bisection on E within the bracket.
     a, b = bracket
@@ -477,6 +503,165 @@ def scf_lda_x(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=300,
         "u": u,
         "V_H": V_H_new,
         "V_x": V_x_new,
+        "r": r,
+        "iterations": iterations,
+        "history": history,
+    }
+
+
+# ===========================================================================
+# Milestone 5: add LDA correlation (Ceperley-Alder / Perdew-Zunger) (Z=2).
+# ===========================================================================
+# Unpolarised (spin-paired) Perdew-Zunger parameters for the CA correlation
+# energy of the uniform electron gas (PDF table, p.5 / spec Eq. C).
+_PZ_A, _PZ_B, _PZ_C, _PZ_D = 0.0311, -0.048, 0.0020, -0.0116
+_PZ_GAMMA, _PZ_BETA1, _PZ_BETA2 = -0.1423, 1.0529, 0.3334
+
+
+def correlation_pz(u, r):
+    """Perdew-Zunger LDA correlation: return (V_c, e_c) on the grid.
+
+    Correlation is the last piece of the quantum correction: electrons avoid one
+    another a little more than plain electrostatics (Hartree) and exchange
+    account for. LDA again borrows the uniform-electron-gas result and applies it
+    pointwise, as a function of the local density through the Wigner-Seitz radius
+        r_s = (3 / (4 pi n))^{1/3},   n(r) = u^2 / (2 pi r^2)  (full density).
+    Small r_s = dense, large r_s = dilute.
+
+    The CA energy is parametrised in two regimes (the branch boundary r_s = 1 is
+    the known pitfall -- a wrong cutoff gives a small but visible energy error):
+
+      r_s >= 1 (low density):
+        e_c = gamma / (1 + beta1 sqrt(r_s) + beta2 r_s)
+        V_c = e_c (1 + (7/6) beta1 sqrt(r_s) + (4/3) beta2 r_s)
+                  / (1 + beta1 sqrt(r_s) + beta2 r_s)
+      r_s < 1 (high density):
+        e_c = A ln r_s + B + C r_s ln r_s + D r_s
+        V_c = A ln r_s + B - A/3 + (2/3) C r_s ln r_s + (2D - C) r_s / 3
+
+    TWO DISTINCT OBJECTS (do not mix them up):
+      * e_c is the correlation energy PER ELECTRON (used in the total energy).
+      * V_c = d(n e_c)/dn is the correlation POTENTIAL (used inside the SCF SE).
+
+    Where the density is negligible (u -> 0 at large r) r_s -> infinity; there
+    both e_c and V_c tend to 0, so we simply leave those points at 0 and only
+    evaluate the formulas where n is appreciable (avoids 0-division / log(inf)).
+    """
+    n = u * u / (2.0 * np.pi * r * r)        # full two-electron density
+    V_c = np.zeros_like(r)
+    e_c = np.zeros_like(r)
+
+    # Only evaluate where there is real density; elsewhere e_c = V_c = 0.
+    has_n = n > 1e-30
+    r_s = np.full_like(r, np.inf)
+    r_s[has_n] = (3.0 / (4.0 * np.pi * n[has_n]))**(1.0 / 3.0)
+
+    # --- Branch 1: r_s >= 1 (and finite) --------------------------------------
+    lo = has_n & (r_s >= 1.0)
+    sq = np.sqrt(r_s[lo])
+    denom = 1.0 + _PZ_BETA1 * sq + _PZ_BETA2 * r_s[lo]
+    e_c[lo] = _PZ_GAMMA / denom
+    V_c[lo] = e_c[lo] * (1.0 + (7.0 / 6.0) * _PZ_BETA1 * sq
+                         + (4.0 / 3.0) * _PZ_BETA2 * r_s[lo]) / denom
+
+    # --- Branch 2: r_s < 1 ----------------------------------------------------
+    hi = has_n & (r_s < 1.0)
+    ln = np.log(r_s[hi])
+    e_c[hi] = (_PZ_A * ln + _PZ_B + _PZ_C * r_s[hi] * ln + _PZ_D * r_s[hi])
+    V_c[hi] = (_PZ_A * ln + _PZ_B - _PZ_A / 3.0
+               + (2.0 / 3.0) * _PZ_C * r_s[hi] * ln
+               + (2.0 * _PZ_D - _PZ_C) * r_s[hi] / 3.0)
+
+    return V_c, e_c
+
+
+def scf_lda_xc(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=300,
+               n_scan=120, eig_tol=1e-9, verbose=True):
+    """Self-consistent helium with full Hartree + Slater exchange + PZ
+    correlation (M5) -- the full LDA, and the headline number.
+
+    A SEPARATE SCF variant: scf_no_xc (M3) and scf_lda_x (M4) are untouched, so
+    their -2.86 and -2.72 gates keep passing. This just adds the correlation
+    potential V_c on top of the M4 setup:
+        V(r) = -Z/r + V_H_full(r) + V_x(r) + V_c(r).
+
+    Total energy: the M4 energy form plus the correlation contribution. The
+    eigenvalue already contains integral V_c n (V_c is in the SE), so to recover
+    the correlation ENERGY integral e_c n we add integral (e_c - V_c) n. In the
+    radial convention integral f n d^3r = 2 integral f u^2 dr, so:
+        E = 2 eps - integral V_H_full u^2 dr
+                  - (1/2) integral u^2 V_x dr
+                  + 2 integral (e_c - V_c) u^2 dr.
+    Note e_c (energy per electron) and V_c (potential) are different objects: the
+    SCF uses V_c, the energy correction uses (e_c - V_c).
+
+    Correlation is a small, attractive correction; it deepens the M4 result from
+    about -2.72 toward -2.83 (closer to the exact -2.90).
+
+    Initialisation ramps all of V_H, V_x, V_c in from zero with mixing w ~ 0.3,
+    as in M4.
+
+    Returns: dict with E, eps, u, V_H, V_x, V_c, r, iterations, history.
+    """
+    if r is None:
+        r = make_grid(h)
+    V_nuc = -Z / r
+
+    # Ramp every interaction term in from zero for a stable start (see M4).
+    V_H = np.zeros_like(r)
+    V_x = np.zeros_like(r)
+    V_c = np.zeros_like(r)
+
+    if verbose:
+        print(f"{'iter':>4}  {'eps (Ha)':>12}  {'E_total (Ha)':>14}  "
+              f"{'d eps':>10}")
+
+    history = []
+    eps_prev = None
+    iterations = 0
+    for it in range(1, max_iter + 1):
+        iterations = it
+        # Step 1: solve the radial SE in the current effective potential. After
+        # the first iteration we warm-start the eigenvalue search at the previous
+        # eps (the eigenvalue barely moves between iterations), which brackets
+        # locally instead of rescanning the whole window -- same root, far faster.
+        V = V_nuc + V_H + V_x + V_c
+        eps, u = eigenstate(V, r, h, e_lo=-0.6 * Z * Z, e_hi=-0.01,
+                            n_scan=n_scan, tol=eig_tol, e_guess=eps_prev)
+
+        # Step 2: rebuild full Hartree, exchange, and correlation from the new
+        # orbital, then form the total energy.
+        V_H1, _, _ = hartree_potential(u, r, h)
+        V_H_new = 2.0 * V_H1                       # full two-electron Hartree
+        V_x_new = exchange_potential(u, r)         # Slater LDA exchange
+        V_c_new, e_c_new = correlation_pz(u, r)    # PZ LDA correlation
+        E_tot = (2.0 * eps
+                 - integrate(V_H_new * u * u, h)
+                 - 0.5 * integrate(u * u * V_x_new, h)
+                 + 2.0 * integrate((e_c_new - V_c_new) * u * u, h))
+
+        d_eps = float("nan") if eps_prev is None else abs(eps - eps_prev)
+        history.append((eps, E_tot))
+        if verbose:
+            print(f"{it:>4}  {eps:>12.6f}  {E_tot:>14.6f}  {d_eps:>10.2e}")
+
+        # Step 4: convergence test on the eigenvalue.
+        if eps_prev is not None and d_eps < tol:
+            break
+        eps_prev = eps
+
+        # Step 3: mix all three potentials for the next iteration.
+        V_H = (1.0 - w) * V_H + w * V_H_new
+        V_x = (1.0 - w) * V_x + w * V_x_new
+        V_c = (1.0 - w) * V_c + w * V_c_new
+
+    return {
+        "E": E_tot,
+        "eps": eps,
+        "u": u,
+        "V_H": V_H_new,
+        "V_x": V_x_new,
+        "V_c": V_c_new,
         "r": r,
         "iterations": iterations,
         "history": history,
