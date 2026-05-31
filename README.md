@@ -14,6 +14,10 @@ answer of **−2.83 Ha**, against an exact value of **−2.90 Ha**.
 All quantities are in **atomic units** ($\hbar = m_e = e = 4\pi\varepsilon_0 = 1$):
 length in Bohr, energy in Hartree (Ha).
 
+> 📖 **New here? Start with the [User Guide](USER_GUIDE.md).** A step-by-step,
+> plain-language walkthrough — how to run the program, what to enter, and how to
+> read the results and the graphs. No coding background needed.
+
 ---
 
 ## Headline results
