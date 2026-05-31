@@ -364,3 +364,120 @@ def scf_no_xc(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=200,
         "iterations": iterations,
         "history": history,
     }
+
+
+# ===========================================================================
+# Milestone 4: add LDA (Slater) exchange to the SCF loop (Z=2).
+# ===========================================================================
+def exchange_potential(u, r):
+    """Slater LDA exchange potential from the radial orbital u(r).
+
+    LDA borrows the exchange energy of the uniform electron gas and applies it
+    point by point: V_x(r) = -(3/pi)^{1/3} n(r)^{1/3}. Here n is the FULL density
+    of BOTH electrons. In terms of u (normalised so integral u^2 dr = 1), the
+    full density is n(r) = u(r)^2 / (2 pi r^2) (twice the single-orbital
+    density), and the potential becomes (PDF Eq. 17):
+        V_x(r) = - ( 3 u(r)^2 / (2 pi^2 r^2) )^{1/3}.
+    It is negative (exchange lowers the energy) and depends only on r for an
+    s-state. Where u -> 0 the density and V_x vanish smoothly; r > 0 on our grid
+    so there is no singularity.
+    """
+    return -(3.0 * u * u / (2.0 * np.pi**2 * r * r))**(1.0 / 3.0)
+
+
+def scf_lda_x(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=300,
+              n_scan=120, eig_tol=1e-9, verbose=True):
+    """Self-consistent helium with full Hartree + Slater LDA exchange (M4).
+
+    This is a SEPARATE SCF variant from scf_no_xc (M3); the M3 path is left
+    untouched so its -2.86 gate keeps passing. Two things change meaning from M3
+    (the second classic bug site, so be deliberate):
+
+      1. The density is now the FULL two-electron density n = u^2/(2 pi r^2)
+         (M3 used the single-orbital density).
+      2. The Hartree is now the FULL Hartree, i.e. the potential of that doubled
+         density, which is exactly TWICE the single-orbital Hartree that
+         hartree_potential() returns:  V_H_full = 2 * V_H_single. We no longer
+         halve it for self-interaction -- because that job now belongs to the
+         exchange term.
+
+    The effective potential inside the loop is
+        V(r) = -Z/r + V_H_full(r) + V_x(r).
+
+    Total energy (PDF Eq. 18 / spec Eq. X-E), with the FULL V_H:
+        E = 2 eps - integral V_H_full u^2 dr - (1/2) integral u^2 V_x dr.
+    The Hartree double-count is removed as before; the -(1/2) integral u^2 V_x
+    converts the exchange potential back into the exchange ENERGY (the energy is
+    half the potential's first moment for this n^{1/3} form).
+
+    Why this is LESS bound than M3 (a good report point). M3 (SIC-Hartree) equals
+    restricted Hartree-Fock and uses EXACT exchange, which removes the
+    self-interaction perfectly, giving -2.86. LDA Slater exchange is only an
+    APPROXIMATE, averaged exchange (borrowed from the uniform electron gas), so
+    it removes the self-interaction only approximately and leaves a residual
+    self-repulsion. That extra repulsion pushes the energy up to about -2.72,
+    i.e. less bound than the exact-exchange HF value.
+
+    Initialisation. We ramp the interaction in from zero (V_H = V_x = 0 on the
+    first step) rather than starting from the compact bare orbital: the full
+    (un-halved) Hartree built from the bare He+ orbital is so repulsive it can
+    unbind the electron. Mixing (w ~ 0.3) then grows the potentials gently to
+    self-consistency.
+
+    Returns: dict with E, eps, u, V_H (full), V_x, r, iterations, history.
+    """
+    if r is None:
+        r = make_grid(h)
+    V_nuc = -Z / r
+
+    # Ramp the interaction in from zero (see docstring) for a stable start.
+    V_H = np.zeros_like(r)   # full Hartree, grown in via mixing
+    V_x = np.zeros_like(r)   # Slater exchange, grown in via mixing
+
+    if verbose:
+        print(f"{'iter':>4}  {'eps (Ha)':>12}  {'E_total (Ha)':>14}  "
+              f"{'d eps':>10}")
+
+    history = []
+    eps_prev = None
+    iterations = 0
+    for it in range(1, max_iter + 1):
+        iterations = it
+        # Step 1: solve the radial SE in the current effective potential.
+        V = V_nuc + V_H + V_x
+        eps, u = eigenstate(V, r, h, e_lo=-0.6 * Z * Z, e_hi=-0.01,
+                            n_scan=n_scan, tol=eig_tol)
+
+        # Step 2: rebuild the FULL Hartree (= 2 x single-orbital) and exchange
+        # from the current orbital, then form the total energy.
+        V_H1, _, _ = hartree_potential(u, r, h)
+        V_H_new = 2.0 * V_H1                      # full two-electron Hartree
+        V_x_new = exchange_potential(u, r)        # Slater LDA exchange
+        E_tot = (2.0 * eps
+                 - integrate(V_H_new * u * u, h)
+                 - 0.5 * integrate(u * u * V_x_new, h))
+
+        d_eps = float("nan") if eps_prev is None else abs(eps - eps_prev)
+        history.append((eps, E_tot))
+        if verbose:
+            print(f"{it:>4}  {eps:>12.6f}  {E_tot:>14.6f}  {d_eps:>10.2e}")
+
+        # Step 4: convergence test on the eigenvalue.
+        if eps_prev is not None and d_eps < tol:
+            break
+        eps_prev = eps
+
+        # Step 3: mix both potentials for the next iteration.
+        V_H = (1.0 - w) * V_H + w * V_H_new
+        V_x = (1.0 - w) * V_x + w * V_x_new
+
+    return {
+        "E": E_tot,
+        "eps": eps,
+        "u": u,
+        "V_H": V_H_new,
+        "V_x": V_x_new,
+        "r": r,
+        "iterations": iterations,
+        "history": history,
+    }

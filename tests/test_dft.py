@@ -85,3 +85,14 @@ def test_m3_scf_no_xc_total_energy(grid):
     """
     res = dft.scf_no_xc(Z=2.0, r=grid, verbose=False)
     assert abs(res["E"] - (-2.86)) < 1e-2
+
+
+# --- Milestone 4: full Hartree + Slater LDA exchange (no correlation) --------
+def test_m4_scf_lda_exchange_total_energy(grid):
+    """SCF with full Hartree + Slater exchange must give E = -2.72 Ha.
+
+    Less bound than the M3 (-2.86, exact-exchange/HF) result because LDA Slater
+    exchange removes the self-interaction only approximately.
+    """
+    res = dft.scf_lda_x(Z=2.0, r=grid, verbose=False)
+    assert abs(res["E"] - (-2.72)) < 1e-2
