@@ -11,11 +11,15 @@ psi = R(r) * Y_00, and normalisation is integral u(r)^2 dr = 1.
 Everything (integration, the Numerov solve, root finding, the Poisson solve) is
 hand-written on purpose so every line can be explained to an examiner.
 
-Milestones implemented here:
-  M0  make_grid, integrate          (scaffolding: grid + reusable integrator)
-  M1  solve_radial, shoot,          (one electron in a bare nucleus -Z/r)
-      find_eigenvalue, normalise
-  M2  hartree_potential             (electron-cloud repulsion via Poisson)
+What lives here, building up the physics one layer at a time:
+  - make_grid, integrate          radial grid + reusable Simpson integrator
+  - solve_radial, shoot,          one electron in a bare nucleus -Z/r
+    eigenstate, find_eigenvalue,  (the radial Schrodinger solver + root finder)
+    normalise
+  - hartree_potential             electron-cloud electrostatic repulsion (Poisson)
+  - scf_no_xc                     self-consistent Hartree (= Hartree-Fock for He)
+  - exchange_potential, scf_lda_x self-consistent LDA with Slater exchange
+  - correlation_pz, scf_lda_xc    full LDA: Slater exchange + PZ correlation
 """
 
 import numpy as np
@@ -31,7 +35,7 @@ R_MAX = 25.0     # Bohr
 
 
 # ===========================================================================
-# Milestone 0: scaffolding -- the grid and the one reusable integrator.
+# Scaffolding: the radial grid and the one reusable integrator.
 # ===========================================================================
 def make_grid(h=H_STEP, r_max=R_MAX):
     """Build the uniform radial grid r = h, 2h, ..., r_max.
@@ -74,7 +78,7 @@ def integrate(y, h=H_STEP):
 
 
 # ===========================================================================
-# Milestone 1: hydrogen radial solver (the core engine).
+# Hydrogen-like radial solver (the core engine reused by every later step).
 # Solve u''(r) = 2[V(r) - E] u(r) for the bound state, V(r) = -Z/r.
 # ===========================================================================
 def solve_radial(E, V, r, h=H_STEP):
@@ -150,11 +154,12 @@ def eigenstate(V, r, h=H_STEP, e_lo=-3.0, e_hi=-0.01, n_scan=200, tol=1e-10,
                e_guess=None):
     """Find the GROUND-STATE energy E and normalised u(r) for ANY potential V(r).
 
-    This is the generalised version of the M1 solver: M1 used the fixed bare
-    potential -Z/r, but the SCF loop (M3+) needs the eigenstate of
-    V(r) = -Z/r + V_H(r) + ... , so the potential is passed in as an array.
+    This is the generalised version of the bare-nucleus solver: find_eigenvalue
+    used the fixed potential -Z/r, but the self-consistent loops need the
+    eigenstate of V(r) = -Z/r + V_H(r) + V_x(r) + ... , so the potential is
+    passed in as an array.
 
-    Two stages (identical algorithm to M1):
+    Two stages (identical algorithm to the bare-nucleus case):
       1. Bracket the ground state. By default we coarse-scan E over [e_lo, e_hi]
          for the lowest (most negative) sign change of the extrapolated u(0); the
          lowest crossing is the nodeless ground state (higher crossings are 2s,
@@ -219,8 +224,9 @@ def find_eigenvalue(Z, r, h=H_STEP, e_lo=None, e_hi=None, n_scan=200, tol=1e-10)
     """Ground-state E and normalised u(r) for the bare nuclear potential -Z/r.
 
     Thin wrapper around `eigenstate` with V = -Z/r and a search window straddling
-    the He-like scale -Z^2/2 (from -0.6 Z^2, below the ground state, up to ~0).
-    Kept as the M1 entry point so the M1 demos/tests read naturally.
+    the hydrogen-like scale -Z^2/2 (from -0.6 Z^2, below the ground state, up to
+    ~0). This is the convenience entry point for the bare-nucleus (hydrogen and
+    He+) checks, where the potential is just -Z/r and reads naturally as such.
     """
     if e_lo is None:
         e_lo = -0.6 * Z * Z
@@ -231,7 +237,8 @@ def find_eigenvalue(Z, r, h=H_STEP, e_lo=None, e_hi=None, n_scan=200, tol=1e-10)
 
 
 # ===========================================================================
-# Milestone 2: Hartree potential via the radial Poisson equation.
+# Hartree potential: the electron cloud's electrostatic repulsion, found by
+# solving the radial Poisson equation.
 # ===========================================================================
 def hartree_potential(u, r, h=H_STEP):
     """Compute the Hartree potential V_H(r) from a normalised orbital u(r).
@@ -288,11 +295,12 @@ def hartree_potential(u, r, h=H_STEP):
 
 
 # ===========================================================================
-# Milestone 3: self-consistent DFT for helium, no exchange-correlation (Z=2).
+# Self-consistent Hartree for helium (no exchange-correlation). For the
+# two-electron singlet this coincides with restricted Hartree-Fock.
 # ===========================================================================
 def scf_no_xc(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=200,
               n_scan=120, eig_tol=1e-9, verbose=True):
-    """Self-consistent helium ground state with the Hartree term only (M3).
+    """Self-consistent helium ground state with the Hartree term only.
 
     The physics. Each of helium's two electrons sits in the same 1s orbital and
     feels two things: the nuclear pull -Z/r AND the electrostatic repulsion of
@@ -307,14 +315,15 @@ def scf_no_xc(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=200,
     removed Hartree potential coincides exactly with the RHF potential, because
     HF exchange does nothing more than cancel the self-interaction: with one
     occupied orbital (2J - K)phi = (2J - J)phi = J phi. So SIC-Hartree == RHF for
-    helium, and -2.86 is the right M3 number. The -2.72 figure is a later
-    milestone (M4: full Hartree + Slater exchange, no correlation).
+    helium, and -2.86 is the right Hartree-only number. The -2.72 figure comes
+    later, once Slater exchange is added (see scf_lda_x).
 
-    The factor-of-2 bookkeeping (the classic trap, see spec section 7). With two
-    electrons the naive Hartree would double-count and would also include each
-    electron interacting with itself. In this no-XC milestone the factor 2 from
-    spin (two electrons in one orbital) exactly cancels the 1/2 that removes the
-    self-interaction, so the effective V_H is simply the potential of a single
+    The factor-of-2 bookkeeping (the classic trap). With two electrons the naive
+    Hartree would double-count and would also include each electron interacting
+    with itself. In this Hartree-only (no exchange-correlation) treatment the
+    factor 2 from spin (two electrons in one orbital) exactly cancels the 1/2
+    that removes the self-interaction, so the effective V_H is simply the
+    potential of a single
     NORMALISED orbital density -- which is exactly what hartree_potential()
     already returns (it solves U'' = -u^2/r with q_max -> 1). So no extra factor
     is applied here; we use hartree_potential(u) directly.
@@ -393,7 +402,8 @@ def scf_no_xc(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=200,
 
 
 # ===========================================================================
-# Milestone 4: add LDA (Slater) exchange to the SCF loop (Z=2).
+# Self-consistent LDA with Slater exchange: add the exchange potential to the
+# full-Hartree SCF loop (Z=2).
 # ===========================================================================
 def exchange_potential(u, r):
     """Slater LDA exchange potential from the radial orbital u(r).
@@ -413,14 +423,15 @@ def exchange_potential(u, r):
 
 def scf_lda_x(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=300,
               n_scan=120, eig_tol=1e-9, verbose=True):
-    """Self-consistent helium with full Hartree + Slater LDA exchange (M4).
+    """Self-consistent helium with full Hartree + Slater LDA exchange.
 
-    This is a SEPARATE SCF variant from scf_no_xc (M3); the M3 path is left
-    untouched so its -2.86 gate keeps passing. Two things change meaning from M3
-    (the second classic bug site, so be deliberate):
+    This is a SEPARATE SCF variant from the Hartree-only scf_no_xc; that path is
+    left untouched so its -2.86 result keeps passing. Two things change meaning
+    relative to the Hartree-only treatment (the second classic bug site, so be
+    deliberate):
 
       1. The density is now the FULL two-electron density n = u^2/(2 pi r^2)
-         (M3 used the single-orbital density).
+         (the Hartree-only run used the single-orbital density).
       2. The Hartree is now the FULL Hartree, i.e. the potential of that doubled
          density, which is exactly TWICE the single-orbital Hartree that
          hartree_potential() returns:  V_H_full = 2 * V_H_single. We no longer
@@ -436,9 +447,10 @@ def scf_lda_x(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=300,
     converts the exchange potential back into the exchange ENERGY (the energy is
     half the potential's first moment for this n^{1/3} form).
 
-    Why this is LESS bound than M3 (a good report point). M3 (SIC-Hartree) equals
-    restricted Hartree-Fock and uses EXACT exchange, which removes the
-    self-interaction perfectly, giving -2.86. LDA Slater exchange is only an
+    Why this is LESS bound than the Hartree-only run (a good report point). That
+    run (SIC-Hartree) equals restricted Hartree-Fock and uses EXACT exchange,
+    which removes the self-interaction perfectly, giving -2.86. LDA Slater
+    exchange is only an
     APPROXIMATE, averaged exchange (borrowed from the uniform electron gas), so
     it removes the self-interaction only approximately and leaves a residual
     self-repulsion. That extra repulsion pushes the energy up to about -2.72,
@@ -510,7 +522,8 @@ def scf_lda_x(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=300,
 
 
 # ===========================================================================
-# Milestone 5: add LDA correlation (Ceperley-Alder / Perdew-Zunger) (Z=2).
+# Full LDA: add Ceperley-Alder / Perdew-Zunger correlation on top of the
+# Slater-exchange SCF loop (Z=2).
 # ===========================================================================
 # Unpolarised (spin-paired) Perdew-Zunger parameters for the CA correlation
 # energy of the uniform electron gas (PDF table, p.5 / spec Eq. C).
@@ -578,14 +591,16 @@ def correlation_pz(u, r):
 def scf_lda_xc(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=300,
                n_scan=120, eig_tol=1e-9, verbose=True):
     """Self-consistent helium with full Hartree + Slater exchange + PZ
-    correlation (M5) -- the full LDA, and the headline number.
+    correlation -- the full LDA, and the headline number.
 
-    A SEPARATE SCF variant: scf_no_xc (M3) and scf_lda_x (M4) are untouched, so
-    their -2.86 and -2.72 gates keep passing. This just adds the correlation
-    potential V_c on top of the M4 setup:
+    A SEPARATE SCF variant: the Hartree-only (scf_no_xc) and exchange-only
+    (scf_lda_x) paths are untouched, so their -2.86 and -2.72 results keep
+    passing. This just adds the correlation potential V_c on top of the
+    Slater-exchange setup:
         V(r) = -Z/r + V_H_full(r) + V_x(r) + V_c(r).
 
-    Total energy: the M4 energy form plus the correlation contribution. The
+    Total energy: the exchange-only energy form plus the correlation
+    contribution. The
     eigenvalue already contains integral V_c n (V_c is in the SE), so to recover
     the correlation ENERGY integral e_c n we add integral (e_c - V_c) n. In the
     radial convention integral f n d^3r = 2 integral f u^2 dr, so:
@@ -595,11 +610,11 @@ def scf_lda_xc(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=300,
     Note e_c (energy per electron) and V_c (potential) are different objects: the
     SCF uses V_c, the energy correction uses (e_c - V_c).
 
-    Correlation is a small, attractive correction; it deepens the M4 result from
-    about -2.72 toward -2.83 (closer to the exact -2.90).
+    Correlation is a small, attractive correction; it deepens the exchange-only
+    result from about -2.72 toward -2.83 (closer to the exact -2.90).
 
     Initialisation ramps all of V_H, V_x, V_c in from zero with mixing w ~ 0.3,
-    as in M4.
+    exactly as in the exchange-only solver.
 
     Returns: dict with E, eps, u, V_H, V_x, V_c, r, iterations, history.
     """
@@ -607,7 +622,9 @@ def scf_lda_xc(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=300,
         r = make_grid(h)
     V_nuc = -Z / r
 
-    # Ramp every interaction term in from zero for a stable start (see M4).
+    # Ramp every interaction term in from zero for a stable start (same reason
+    # as the Slater-exchange solver: the full Hartree from a compact starting
+    # orbital is repulsive enough to unbind the electron if applied all at once).
     V_H = np.zeros_like(r)
     V_x = np.zeros_like(r)
     V_c = np.zeros_like(r)

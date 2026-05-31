@@ -1,6 +1,6 @@
 method,this_work_Ha,reference_Ha
-"M3: SIC-Hartree, no XC (= RHF)",-2.8616,-2.8600
-"M4: + Slater LDA exchange",-2.7236,-2.7200
-"M5: + PZ correlation (full LDA)",-2.8342,-2.8300
+"Self-consistent Hartree (= RHF)",-2.8616,-2.8600
+"LDA, Slater exchange",-2.7236,-2.7200
+"Full LDA (Slater X + PZ corr.)",-2.8342,-2.8300
 "Hartree-Fock (reference)",,-2.8617
 "Exact / experiment",,-2.9037
