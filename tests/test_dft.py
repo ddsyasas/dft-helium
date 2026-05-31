@@ -72,3 +72,16 @@ def test_m2_hartree_hydrogen_closed_form(grid):
     assert abs(q_max - 1.0) < TOL
     assert np.max(np.abs(U - U_exact)) < TOL
     assert np.max(np.abs(V_H - VH_exact)) < TOL
+
+
+# --- Milestone 3: self-consistent helium, Hartree only (no XC) ---------------
+def test_m3_scf_no_xc_total_energy(grid):
+    """SCF with the self-interaction-removed Hartree must give E = -2.86 Ha.
+
+    This is the restricted Hartree-Fock value, and it is the CORRECT M3 answer:
+    for a two-electron closed-shell singlet the SIC-Hartree potential equals the
+    RHF potential exactly (exchange only cancels the self-interaction). The -2.72
+    figure belongs to M4 (full Hartree + Slater exchange, no correlation).
+    """
+    res = dft.scf_no_xc(Z=2.0, r=grid, verbose=False)
+    assert abs(res["E"] - (-2.86)) < 1e-2

@@ -138,30 +138,34 @@ def normalise(u, h=H_STEP):
     return u
 
 
-def find_eigenvalue(Z, r, h=H_STEP, e_lo=None, e_hi=None, n_scan=200, tol=1e-10):
-    """Find the GROUND-STATE energy E and normalised u(r) for potential -Z/r.
-
-    Two stages:
-      1. Coarse scan of E over [e_lo, e_hi] for the lowest (most negative)
-         sign change of shoot(E). The lowest crossing is the nodeless ground
-         state; higher crossings are excited s-states (2s, ...).
-      2. Bisection inside that bracket until the energy is pinned to 'tol'.
-
-    Default window straddles the He-like scale -Z^2/2 but stays safely wide:
-    from -0.6 Z^2 (below the ground state) up to ~0 (the ionisation threshold).
+def _u0(E, V, r, h):
+    """Inward-solve at energy E for an arbitrary potential V(r); return
+    (extrapolated u(0), full u array). The sign of u(0) is the bisection signal.
     """
-    if e_lo is None:
-        e_lo = -0.6 * Z * Z
-    if e_hi is None:
-        e_hi = -0.01
+    u = solve_radial(E, V, r, h)
+    return 2.0 * u[0] - u[1], u
 
+
+def eigenstate(V, r, h=H_STEP, e_lo=-3.0, e_hi=-0.01, n_scan=200, tol=1e-10):
+    """Find the GROUND-STATE energy E and normalised u(r) for ANY potential V(r).
+
+    This is the generalised version of the M1 solver: M1 used the fixed bare
+    potential -Z/r, but the SCF loop (M3+) needs the eigenstate of
+    V(r) = -Z/r + V_H(r) + ... , so the potential is passed in as an array.
+
+    Two stages (identical algorithm to M1):
+      1. Coarse scan of E over [e_lo, e_hi] for the lowest (most negative) sign
+         change of the extrapolated u(0). The lowest crossing is the nodeless
+         ground state; higher crossings are excited s-states (2s, ...).
+      2. Bisection inside that bracket until the energy is pinned to 'tol'.
+    """
     # Stage 1: scan for the first sign change as E increases from e_lo.
     energies = np.linspace(e_lo, e_hi, n_scan)
     e_prev = energies[0]
-    prev_val, _ = shoot(e_prev, Z, r, h)
+    prev_val, _ = _u0(e_prev, V, r, h)
     bracket = None
     for E in energies[1:]:
-        val, _ = shoot(E, Z, r, h)
+        val, _ = _u0(E, V, r, h)
         if np.sign(val) != np.sign(prev_val):
             bracket = (e_prev, E)
             break
@@ -172,17 +176,32 @@ def find_eigenvalue(Z, r, h=H_STEP, e_lo=None, e_hi=None, n_scan=200, tol=1e-10)
 
     # Stage 2: bisection on E within the bracket.
     a, b = bracket
-    fa, _ = shoot(a, Z, r, h)
+    fa, _ = _u0(a, V, r, h)
     while (b - a) > tol:
         m = 0.5 * (a + b)
-        fm, _ = shoot(m, Z, r, h)
+        fm, _ = _u0(m, V, r, h)
         if np.sign(fm) == np.sign(fa):
             a, fa = m, fm
         else:
             b = m
     E = 0.5 * (a + b)
-    _, u = shoot(E, Z, r, h)
+    _, u = _u0(E, V, r, h)
     return E, normalise(u, h)
+
+
+def find_eigenvalue(Z, r, h=H_STEP, e_lo=None, e_hi=None, n_scan=200, tol=1e-10):
+    """Ground-state E and normalised u(r) for the bare nuclear potential -Z/r.
+
+    Thin wrapper around `eigenstate` with V = -Z/r and a search window straddling
+    the He-like scale -Z^2/2 (from -0.6 Z^2, below the ground state, up to ~0).
+    Kept as the M1 entry point so the M1 demos/tests read naturally.
+    """
+    if e_lo is None:
+        e_lo = -0.6 * Z * Z
+    if e_hi is None:
+        e_hi = -0.01
+    return eigenstate(-Z / r, r, h, e_lo=e_lo, e_hi=e_hi,
+                      n_scan=n_scan, tol=tol)
 
 
 # ===========================================================================
@@ -240,3 +259,108 @@ def hartree_potential(u, r, h=H_STEP):
     # --- Step 3: the Hartree potential itself. ---
     V_H = U / r
     return V_H, U, q_max
+
+
+# ===========================================================================
+# Milestone 3: self-consistent DFT for helium, no exchange-correlation (Z=2).
+# ===========================================================================
+def scf_no_xc(Z=2.0, r=None, h=H_STEP, w=0.3, tol=1e-7, max_iter=200,
+              n_scan=120, eig_tol=1e-9, verbose=True):
+    """Self-consistent helium ground state with the Hartree term only (M3).
+
+    The physics. Each of helium's two electrons sits in the same 1s orbital and
+    feels two things: the nuclear pull -Z/r AND the electrostatic repulsion of
+    the *other* electron's cloud, the Hartree potential V_H(r). But V_H depends
+    on the orbital, which depends on V_H -- a circular problem. We break the
+    circle by iterating to self-consistency (SCF): guess -> solve -> rebuild the
+    potential -> repeat until the eigenvalue stops moving.
+
+    Expected result: E = -2.86 Ha. That is the restricted Hartree-Fock value,
+    and getting it here is CORRECT, not a bug. For a two-electron closed-shell
+    singlet (both electrons in one spatial 1s orbital) the self-interaction-
+    removed Hartree potential coincides exactly with the RHF potential, because
+    HF exchange does nothing more than cancel the self-interaction: with one
+    occupied orbital (2J - K)phi = (2J - J)phi = J phi. So SIC-Hartree == RHF for
+    helium, and -2.86 is the right M3 number. The -2.72 figure is a later
+    milestone (M4: full Hartree + Slater exchange, no correlation).
+
+    The factor-of-2 bookkeeping (the classic trap, see spec section 7). With two
+    electrons the naive Hartree would double-count and would also include each
+    electron interacting with itself. In this no-XC milestone the factor 2 from
+    spin (two electrons in one orbital) exactly cancels the 1/2 that removes the
+    self-interaction, so the effective V_H is simply the potential of a single
+    NORMALISED orbital density -- which is exactly what hartree_potential()
+    already returns (it solves U'' = -u^2/r with q_max -> 1). So no extra factor
+    is applied here; we use hartree_potential(u) directly.
+
+    The algorithm:
+      0. Initial guess: the bare-nucleus orbital (V = -Z/r), giving its V_H.
+      1. Build V(r) = -Z/r + V_H(r) and solve for the ground state (eps, u).
+      2. Rebuild the Hartree potential from the new u.
+      3. Mix:  V_H <- (1-w) V_H_old + w V_H_new   (w ~ 0.3) to damp oscillation
+         (PDF/spec recommendation; pure replacement, w=1, can oscillate).
+      4. Repeat until |eps - eps_prev| < tol.
+
+    Total energy (PDF Eq. 13 / spec Eq. SCF):
+        E = 2 eps - integral V_H(r) u(r)^2 dr.
+    The 2 eps adds both electrons' single-particle energies; each already
+    contains the full electron-electron interaction once, so summing them
+    double-counts it. Subtracting integral V_H u^2 removes that one extra count.
+
+    Inputs:  Z (nuclear charge), r (grid; built if None), h, mixing w,
+             convergence tol on eps, max_iter, verbose (print E per iteration).
+    Returns: dict with E (total energy), eps (eigenvalue), u, V_H, r,
+             iterations, and the per-iteration history of (eps, E).
+    """
+    if r is None:
+        r = make_grid(h)
+    V_nuc = -Z / r
+
+    # --- Step 0: initial guess from the bare nucleus (no repulsion yet). ---
+    eps, u = eigenstate(V_nuc, r, h, e_lo=-0.6 * Z * Z, e_hi=-0.01,
+                        n_scan=n_scan, tol=eig_tol)
+    V_H, _, _ = hartree_potential(u, r, h)
+
+    if verbose:
+        print(f"{'iter':>4}  {'eps (Ha)':>12}  {'E_total (Ha)':>14}  "
+              f"{'d eps':>10}")
+
+    history = []
+    eps_prev = None
+    iterations = 0
+    for it in range(1, max_iter + 1):
+        iterations = it
+        # Step 1: solve the radial SE in the current effective potential.
+        # The repulsive V_H raises the level above the bare -Z^2/2, so search a
+        # window from below the bare ground state up to the ionisation edge.
+        V = V_nuc + V_H
+        eps, u = eigenstate(V, r, h, e_lo=-0.6 * Z * Z, e_hi=-0.01,
+                            n_scan=n_scan, tol=eig_tol)
+
+        # Step 2: Hartree potential of the *current* density (self-consistent
+        # piece used in the energy), plus the energy itself.
+        V_H_new, _, _ = hartree_potential(u, r, h)
+        E_tot = 2.0 * eps - integrate(V_H_new * u * u, h)
+
+        d_eps = float("nan") if eps_prev is None else abs(eps - eps_prev)
+        history.append((eps, E_tot))
+        if verbose:
+            print(f"{it:>4}  {eps:>12.6f}  {E_tot:>14.6f}  {d_eps:>10.2e}")
+
+        # Step 4: convergence test on the eigenvalue.
+        if eps_prev is not None and d_eps < tol:
+            break
+        eps_prev = eps
+
+        # Step 3: mix the Hartree potential for the next iteration.
+        V_H = (1.0 - w) * V_H + w * V_H_new
+
+    return {
+        "E": E_tot,
+        "eps": eps,
+        "u": u,
+        "V_H": V_H_new,
+        "r": r,
+        "iterations": iterations,
+        "history": history,
+    }
